@@ -13,9 +13,16 @@ import secrets
 import bcrypt
 from datetime import datetime, timezone
 import requests
+# Object Storage
+import cloudinary
+import cloudinary.uploader
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+cloudinary.config(
+    secure=True  # usa automáticamente CLOUDINARY_URL del .env
+)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -29,47 +36,17 @@ import stripe
 PLATFORM_STRIPE_KEY = os.environ.get("STRIPE_API_KEY")
 stripe.api_key = PLATFORM_STRIPE_KEY
 
-# Object Storage
-STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
-EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
-APP_NAME = "vexlfit"
-storage_key = None
 
-def init_storage():
-    global storage_key
-    if storage_key:
-        return storage_key
-    try:
-        resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
-        resp.raise_for_status()
-        storage_key = resp.json()["storage_key"]
-        return storage_key
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
-        return None
 
-def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    if not key:
-        raise HTTPException(status_code=500, detail="Storage not initialized")
-    resp = requests.put(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key, "Content-Type": content_type},
-        data=data, timeout=120
+def upload_file_to_cloudinary(file_bytes: bytes, folder: str):
+    result = cloudinary.uploader.upload(
+        file_bytes,
+        folder=folder
     )
-    resp.raise_for_status()
-    return resp.json()
+    return result["secure_url"]
 
-def get_object(path: str) -> tuple:
-    key = init_storage()
-    if not key:
-        raise HTTPException(status_code=500, detail="Storage not initialized")
-    resp = requests.get(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key}, timeout=60
-    )
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+
+
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -321,13 +298,23 @@ async def update_influencer_profile(data: InfluencerUpdate, influencer: dict = D
 
 @api_router.post("/influencer/upload-logo")
 async def upload_logo(file: UploadFile = File(...), influencer: dict = Depends(get_influencer_by_code)):
-    ext = file.filename.split(".")[-1] if "." in file.filename else "png"
-    path = f"{APP_NAME}/logos/{influencer['id']}/{uuid.uuid4()}.{ext}"
     data = await file.read()
-    result = put_object(path, data, file.content_type or "image/png")
     
-    await db.influencers.update_one({"id": influencer["id"]}, {"$set": {"logo_url": result["path"]}})
-    return {"path": result["path"]}
+    # Subir a Cloudinary
+    result = cloudinary.uploader.upload(
+        data,
+        folder=f"vexlfit/logos/{influencer['id']}"
+    )
+    
+    url = result["secure_url"]
+    
+    # Guardar en DB
+    await db.influencers.update_one(
+        {"id": influencer["id"]},
+        {"$set": {"logo_url": url}}
+    )
+    
+    return {"url": url}
 
 # ========== STRIPE CONNECT ENDPOINTS ==========
 
@@ -731,24 +718,34 @@ async def add_progress(data: UserProgressCreate, user: dict = Depends(get_curren
 
 @api_router.post("/user/progress/photo")
 async def upload_progress_photo(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    path = f"{APP_NAME}/progress/{user['id']}/{uuid.uuid4()}.{ext}"
     data = await file.read()
-    result = put_object(path, data, file.content_type or "image/jpeg")
-    
-    # Create progress entry with photo
+
+    # Subir a Cloudinary
+    result = cloudinary.uploader.upload(
+        data,
+        folder=f"vexlfit/progress/{user['id']}",
+        transformation=[
+            {"width": 800, "height": 800, "crop": "limit"},
+            {"quality": "auto"}
+        ]
+    )
+
+    url = result["secure_url"]
+
+    # Guardar progreso
     progress = {
         "id": str(uuid.uuid4()),
         "user_id": user["id"],
         "weight": None,
         "body_fat": None,
-        "photo_url": result["path"],
+        "photo_url": url,
         "notes": "Progress photo",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
+
     await db.user_progress.insert_one(progress)
-    
-    return {"path": result["path"], "progress_id": progress["id"]}
+
+    return {"url": url, "progress_id": progress["id"]}
 
 @api_router.get("/user/progress", response_model=List[UserProgressResponse])
 async def get_user_progress(user: dict = Depends(get_current_user)):
@@ -762,15 +759,6 @@ async def get_user_nutrition(user: dict = Depends(get_current_user)):
 
 # ========== FILE SERVING ==========
 
-@api_router.get("/files/{path:path}")
-async def serve_file(path: str, auth: str = Query(None)):
-    try:
-        data, content_type = get_object(path)
-        return Response(content=data, media_type=content_type)
-    except Exception as e:
-        logger.error(f"Error serving file: {e}")
-        raise HTTPException(status_code=404, detail="File not found")
-
 # ========== STRIPE PAYMENT ==========
 
 class CheckoutRequest(BaseModel):
@@ -778,40 +766,51 @@ class CheckoutRequest(BaseModel):
 
 @api_router.post("/checkout/create")
 async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_current_user)):
-    influencer = await db.influencers.find_one({"id": user["influencer_id"]}, {"_id": 0})
+    influencer = await db.influencers.find_one(
+        {"id": user["influencer_id"]},
+        {"_id": 0}
+    )
     if not influencer:
         raise HTTPException(status_code=404, detail="Brand not found")
-    
+
+    # ✅ Validar URL
+    if not data.origin_url.startswith("http"):
+        raise HTTPException(status_code=400, detail="Invalid origin URL")
+
     host_url = data.origin_url.rstrip("/")
     success_url = f"{host_url}/{influencer['brand_name']}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{host_url}/{influencer['brand_name']}"
+
+    # ✅ Evitar errores de float
     amount = float(influencer.get("subscription_price", 29.99))
+    unit_amount = int(round(amount * 100))
+
     platform_fee_percent = float(influencer.get("platform_fee_percent", 5.0))
-    
-    # Determinar qué método de pago usar
+
     stripe_account_id = influencer.get("stripe_account_id")
-    stripe_api_key = influencer.get("stripe_api_key")
     stripe_connected = influencer.get("stripe_connected", False)
-    
-    session_data = None
-    payment_method = "platform"  # Default: pagos a cuenta de la plataforma
-    
+
+    payment_method = "platform"
+
     try:
-        # OPCIÓN 1: Stripe Connect (cuenta conectada del influencer)
+        # ==============================
+        # 🔥 OPCIÓN 1: STRIPE CONNECT
+        # ==============================
         if stripe_account_id and stripe_connected:
             payment_method = "connect"
-            application_fee = int(amount * 100 * (platform_fee_percent / 100))  # Fee en centavos
-            
+
+            application_fee = int(round(unit_amount * (platform_fee_percent / 100)))
+
             session = stripe.checkout.Session.create(
                 mode="payment",
                 payment_method_types=["card"],
                 line_items=[{
                     "price_data": {
                         "currency": "usd",
-                        "unit_amount": int(amount * 100),
+                        "unit_amount": unit_amount,
                         "product_data": {
                             "name": f"Suscripción {influencer['name']}",
-                            "description": f"Acceso mensual al programa de {influencer['brand_name']}"
+                            "description": f"Acceso mensual a {influencer['brand_name']}"
                         }
                     },
                     "quantity": 1
@@ -826,75 +825,53 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
                 cancel_url=cancel_url,
                 metadata={
                     "user_id": user["id"],
+                    "email": user.get("email"),
                     "influencer_id": influencer["id"],
                     "brand_name": influencer["brand_name"],
                     "payment_method": "connect"
                 }
             )
-            session_data = {"session_id": session.id, "url": session.url}
-            
-        # OPCIÓN 2: API Key manual del influencer
-        elif stripe_api_key:
-            payment_method = "manual"
-            # Usar la key del influencer directamente
-            original_key = stripe.api_key
-            stripe.api_key = stripe_api_key
-            
-            try:
-                session = stripe.checkout.Session.create(
-                    mode="payment",
-                    payment_method_types=["card"],
-                    line_items=[{
-                        "price_data": {
-                            "currency": "usd",
-                            "unit_amount": int(amount * 100),
-                            "product_data": {
-                                "name": f"Suscripción {influencer['name']}",
-                                "description": f"Acceso mensual al programa de {influencer['brand_name']}"
-                            }
-                        },
-                        "quantity": 1
-                    }],
-                    success_url=success_url,
-                    cancel_url=cancel_url,
-                    metadata={
-                        "user_id": user["id"],
-                        "influencer_id": influencer["id"],
-                        "brand_name": influencer["brand_name"],
-                        "payment_method": "manual"
-                    }
-                )
-                session_data = {"session_id": session.id, "url": session.url}
-            finally:
-                stripe.api_key = original_key
-                
-        # OPCIÓN 3: Cuenta de la plataforma (fallback)
+
+        # ==============================
+        # 🔥 OPCIÓN 2: PLATAFORMA (CLEAN)
+        # ==============================
         else:
             payment_method = "platform"
-            webhook_url = f"{host_url}/api/webhook/stripe"
-            stripe_checkout = StripeCheckout(api_key=PLATFORM_STRIPE_KEY, webhook_url=webhook_url)
-            
-            checkout_request = CheckoutSessionRequest(
-                amount=amount,
-                currency="usd",
+
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                payment_method_types=["card"],
+                line_items=[{
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": unit_amount,
+                        "product_data": {
+                            "name": f"Suscripción {influencer['name']}",
+                            "description": f"Acceso mensual a {influencer['brand_name']}"
+                        }
+                    },
+                    "quantity": 1
+                }],
                 success_url=success_url,
                 cancel_url=cancel_url,
                 metadata={
                     "user_id": user["id"],
+                    "email": user.get("email"),
                     "influencer_id": influencer["id"],
                     "brand_name": influencer["brand_name"],
                     "payment_method": "platform"
                 }
             )
-            session = await stripe_checkout.create_checkout_session(checkout_request)
-            session_data = {"session_id": session.session_id, "url": session.url}
-        
-        # Guardar transacción
+
+        # ==============================
+        # 💾 GUARDAR TRANSACCIÓN
+        # ==============================
         transaction = {
             "id": str(uuid.uuid4()),
-            "session_id": session_data["session_id"],
+            "session_id": session.id,
             "user_id": user["id"],
             "influencer_id": influencer["id"],
+            "stripe_account_id": stripe_account_id,
             "amount": amount,
             "currency": "usd",
             "payment_method": payment_method,
@@ -902,14 +879,19 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
             "payment_status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat()
         }
+
         await db.payment_transactions.insert_one(transaction)
-        
-        return {"url": session_data["url"], "session_id": session_data["session_id"], "payment_method": payment_method}
-        
+
+        return {
+            "url": session.url,
+            "session_id": session.id,
+            "payment_method": payment_method
+        }
+
     except stripe.error.StripeError as e:
         logger.error(f"Stripe checkout error: {e}")
         raise HTTPException(status_code=400, detail=f"Payment error: {str(e)}")
-
+    
 @api_router.get("/checkout/status/{session_id}")
 async def get_checkout_status(session_id: str, request: Request):
     # Buscar la transacción para saber qué método se usó
@@ -960,33 +942,62 @@ async def get_checkout_status(session_id: str, request: Request):
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    body = await request.body()
-    signature = request.headers.get("Stripe-Signature")
-    
-    api_key = os.environ.get("STRIPE_API_KEY")
-    host_url = str(request.base_url).rstrip("/")
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    
-    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
-    
+    payload = await request.body()
+    sig_header = request.headers.get("Stripe-Signature")
+
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
     try:
-        webhook_response = await stripe_checkout.handle_webhook(body, signature)
-        
-        if webhook_response.payment_status == "paid":
-            await db.payment_transactions.update_one(
-                {"session_id": webhook_response.session_id},
-                {"$set": {"payment_status": "paid"}}
-            )
-            if webhook_response.metadata and "user_id" in webhook_response.metadata:
-                await db.users.update_one(
-                    {"id": webhook_response.metadata["user_id"]},
-                    {"$set": {"subscription_status": "paid"}}
-                )
-        
-        return {"received": True}
+        event = stripe.Webhook.construct_event(
+            payload,
+            sig_header,
+            endpoint_secret
+        )
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return {"received": True}
+        raise HTTPException(status_code=400, detail="Webhook error")
+
+    # ==============================
+    # 🎯 EVENTOS IMPORTANTES
+    # ==============================
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+
+        session_id = session.get("id")
+        metadata = session.get("metadata", {})
+
+        # ✅ Marcar transacción como pagada
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "payment_status": "paid",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+
+        # ✅ Activar suscripción usuario
+        user_id = metadata.get("user_id")
+        if user_id:
+            await db.users.update_one(
+                {"id": user_id},
+                {"$set": {
+                    "subscription_status": "paid",
+                    "subscription_updated_at": datetime.now(timezone.utc).isoformat()
+                }}
+            )
+
+    # (Opcional pero PRO)
+    elif event["type"] == "checkout.session.expired":
+        session = event["data"]["object"]
+
+        await db.payment_transactions.update_one(
+            {"session_id": session.get("id")},
+            {"$set": {"payment_status": "expired"}}
+        )
+
+    return {"received": True}
 
 # ========== ROOT ENDPOINT ==========
 
@@ -1005,13 +1016,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup():
-    try:
-        init_storage()
-        logger.info("Storage initialized")
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
